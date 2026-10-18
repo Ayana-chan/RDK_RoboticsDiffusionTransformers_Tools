@@ -1,5 +1,7 @@
 English | [简体中文](./README_cn.md)
 
+> 本分支保存三任务数据的导出适配，涉及校准输入语义，独立于运行时并发优化。改动和验证范围见[导出适配说明](research/export-adaptation.md)。以下保留上游部署文档。
+
 ```
 GitHub: https://github.com/WuChao-2024/RDK_RoboticsDiffusionTransformers_Tools
 FeiShu Document: https://horizonrobotics.feishu.cn/docx/IRVLdawAUoUAoUxNJv7cGlM4nHg

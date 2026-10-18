@@ -85,7 +85,10 @@ def main():
     parser.add_argument('--left_arm_dim', type=int, default=6, help="")
     parser.add_argument('--right_arm_dim', type=int, default=6, help="")
     parser.add_argument('--cal_data_device', type=str, default='cuda', help="")
+    parser.add_argument('--seed', type=int, default=20260913, help="")
     opt = parser.parse_args()
+    np.random.seed(opt.seed)
+    torch.manual_seed(opt.seed)
     logger.info(opt)
 
     # Create WorkSpace
@@ -1293,25 +1296,27 @@ def get_training_samples(data_dir, num_samples=100):
                                     if len(cam_images) < 2:
                                         cam_images = [cam_images[0]] * 2
                                     multi_cam_images[cam_name] = cam_images
-                            # 语言嵌入
-                            lang_embed_path = os.path.join(instructions_dir, f'lang_embed_{step_idx}.pt')
-                            if os.path.exists(lang_embed_path):
-                                try:
-                                    lang_embed = torch.load(lang_embed_path)
-                                except Exception as e:
-                                    logger.error(f"Error reading text file {lang_embed_path}: {e}")
-                                    lang_embed = None
-                            lang_str_path = os.path.join(instructions_dir, f'txt_lang_embed_{step_idx}.txt')
-                            if os.path.exists(lang_str_path):
-                                try:
-                                    with open(lang_str_path, 'r', encoding='utf-8') as f:
-                                        lang_str = f.read().strip()  # 读取内容并去除首尾空白
-                                except Exception as e:
-                                    logger.error(f"Error reading text file {lang_str_path}: {e}")
-                                    lang_str = None   
+                            # 指令序号与轨迹时间步属于不同索引域。
+                            embed_paths = sorted(
+                                [
+                                    path for path in os.listdir(instructions_dir)
+                                    if re.fullmatch(r'lang_embed_[0-9]+[.]pt', path)
+                                ],
+                                key=lambda path: int(re.search(r'[0-9]+', path).group()),
+                            )
+                            if not embed_paths:
+                                raise FileNotFoundError(f'No language embeddings in {instructions_dir}')
+                            instruction_idx = np.random.randint(0, len(embed_paths))
+                            lang_embed_path = os.path.join(instructions_dir, embed_paths[instruction_idx])
+                            lang_str_path = os.path.join(
+                                instructions_dir, f'txt_lang_embed_{instruction_idx}.txt'
+                            )
+                            lang_embed = torch.load(lang_embed_path)
+                            with open(lang_str_path, 'r', encoding='utf-8') as f:
+                                lang_str = f.read().strip()
                             training_samples.append({
                                 'multi_cam_images': multi_cam_images,  # 多摄像头多历史帧
-                                'joints': actions[step_idx],
+                                'joints': qpos[step_idx],
                                 # 'state': state[0],  # (128,)
                                 # 'action_sequence': action_sequence,  # (64, 128)
                                 'lang_embed': lang_embed,
