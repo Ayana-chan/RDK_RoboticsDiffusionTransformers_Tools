@@ -431,6 +431,18 @@ class BPU_RDT_Policy():
             self.noise_scheduler_sample.set_timesteps(self.num_inference_timesteps)
             logger.debug("\033[92m" + f"DiT conditional_sample time = {1000*(time() - begin_time):.2f} ms" + "\033[0m")
 
+            # 条件仅在本次 step 内复用；下次请求和语言更新仍重新准备。
+            freq = ctrl_freqs.float().contiguous().cpu().detach().numpy()
+            lang_c = self.lang_c.float().contiguous().cpu().detach().numpy()
+            lang_mask = lang_attn_mask.float().contiguous().cpu().detach().numpy()
+            pad_rows = 64 - lang_mask.shape[1]
+            padded = np.pad(lang_mask, ((0,0), (0,pad_rows)), mode="constant")
+            mask_float = np.where(padded, 0.0, -512.0).astype(np.float32)
+            lang_cond_padded = np.pad(lang_c, pad_width=((0, 0), (0, pad_rows), (0,0)), mode="constant", constant_values=0)
+            freq_input = np.ascontiguousarray(freq.astype(np.int32))
+            lang_input = np.ascontiguousarray(lang_cond_padded)
+            mask_input = np.ascontiguousarray(mask_float)
+
             # 首轮 state2 只依赖初始噪声和 action mask，可与视觉执行重叠。
             action_traj = torch.cat([noisy_action, action_mask], dim=2)
             first_action_traj = torch.from_numpy(self.state_adaptor2.run([self.state_adaptor2.get_outputs()[0].name], {self.state_adaptor2.get_inputs()[0].name: action_traj.numpy()})[0])
@@ -446,6 +458,8 @@ class BPU_RDT_Policy():
         img_cond = torch.from_numpy(self.img_adaptor([image_embeds.float().contiguous().cpu().detach().numpy()])[0])
         logger.debug("\033[92m" + f"image adaptor time = {1000*(time() - begin_time):.2f} ms" + "\033[0m")
 
+        img_c = img_cond.float().contiguous().cpu().detach().numpy()
+        img_input = np.ascontiguousarray(img_c)
 
         for step_index, t in enumerate(self.noise_scheduler_sample.timesteps):
             begin_time = time()
@@ -459,19 +473,16 @@ class BPU_RDT_Policy():
             state_action_traj = torch.cat([state_traj, action_traj], dim=1)
             # Predict the model output
             x = state_action_traj.float().contiguous().cpu().detach().numpy()
-            freq = ctrl_freqs.float().contiguous().cpu().detach().numpy()
             t_ = t.float().contiguous().cpu().detach().numpy()
-            lang_c = self.lang_c.float().contiguous().cpu().detach().numpy()
-            img_c = img_cond.float().contiguous().cpu().detach().numpy()
-            lang_mask = lang_attn_mask.float().contiguous().cpu().detach().numpy()
-            pad_rows = 64 - lang_mask.shape[1]
-            padded = np.pad(lang_mask, ((0,0), (0,pad_rows)), mode="constant")
-            mask_float = np.where(padded, 0.0, -512.0).astype(np.float32)
-            lang_cond_padded = np.pad(lang_c, pad_width=((0, 0), (0, pad_rows), (0,0)), mode="constant", constant_values=0)
             logger.debug("\033[92m" + f"DiT PreProcess time = {1000*(time() - begin_time):.2f} ms" + "\033[0m")
             # BPU
             begin_time = time()
-            model_output = torch.from_numpy(self.dit([x.copy(), freq.astype(np.int32).copy(), np.expand_dims(t_.astype(np.int32), axis=0).copy(), lang_cond_padded.copy(), img_c.copy(), mask_float.copy()])[0])
+            # 已审计 C++ start 在返回前同步复制输入；这里仅保证连续布局。
+            model_output = torch.from_numpy(self.dit([
+                np.ascontiguousarray(x), freq_input,
+                np.ascontiguousarray(np.expand_dims(t_.astype(np.int32), axis=0)),
+                lang_input, img_input, mask_input,
+            ])[0])
             logger.debug("\033[92m" + f"DiT BPU Forward time = {1000*(time() - begin_time):.2f} ms" + "\033[0m")
 
             # Compute previous actions: x_t -> x_t-1
