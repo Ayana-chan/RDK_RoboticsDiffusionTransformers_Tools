@@ -318,21 +318,53 @@ class BPU_RDT_Policy():
         for output_ in m.get_outputs():
             logger.info(output_)
     
-    def vision_emb_single(self, imgs_list):
-        begin_time = time()
-        last_hidden_states = []
+    def vision_emb_submit(self, imgs_list, pending):
+        if pending:
+            raise ValueError("待提交列表必须为空；每个实例仅允许一个请求")
+        if getattr(self, "_vision_sdk_failed", False):
+            raise RuntimeError("此前视觉 SDK 调用失败，任务状态未知；必须重建运行时")
         for i in range(6):
-            # Pre Process
             img_resized = cv2.resize(imgs_list[i], (384, 288))
-            img_padded = cv2.copyMakeBorder( img_resized, 48, 48, 0, 0, cv2.BORDER_CONSTANT, value=(127, 127, 127))
+            img_padded = cv2.copyMakeBorder(img_resized, 48, 48, 0, 0, cv2.BORDER_CONSTANT, value=(127, 127, 127))
             input_tensor = np.expand_dims(img_padded.transpose((2, 0, 1)), axis=0).astype(np.float32) / 127.5 - 1.0
-            # Forward
-            begin_time = time()
-            self.siglip.start([input_tensor.copy()], task_id=i)
-        for i in range(6):
-            last_hidden_states.append(torch.from_numpy(self.siglip.wait(task_id=i)[0]))
-        logger.debug("\033[92m" + f"SigLIP BPU Forward time = {1000*(time() - begin_time):.2f} ms" + "\033[0m")
+            try:
+                self.siglip.start([input_tensor.copy()], task_id=i)
+            except BaseException:
+                # start 可能在创建 native 句柄后失败，现有接口不能安全恢复该任务。
+                self._vision_sdk_failed = True
+                raise
+            pending.append(i)
+
+    def vision_emb_collect(self, pending):
+        last_hidden_states = []
+        while pending:
+            task_id = pending.pop(0)
+            try:
+                output = self.siglip.wait(task_id=task_id)
+            except BaseException:
+                # wait 的失败阶段未知，不能盲目再次 wait 同一任务。
+                self._vision_sdk_failed = True
+                raise
+            last_hidden_states.append(torch.from_numpy(output[0]))
         return torch.cat(last_hidden_states, dim=0)
+
+    def vision_emb_drain(self, pending):
+        # 正常 collect 后列表为空；异常路径尽力回收其余任务，保留最初异常。
+        while pending:
+            task_id = pending.pop(0)
+            try:
+                self.siglip.wait(task_id=task_id)
+            except BaseException:
+                self._vision_sdk_failed = True
+                logger.exception("视觉任务回收失败，须重建运行时；task_id=%s", task_id)
+
+    def vision_emb_single(self, imgs_list):
+        pending = []
+        try:
+            self.vision_emb_submit(imgs_list, pending)
+            return self.vision_emb_collect(pending)
+        finally:
+            self.vision_emb_drain(pending)
 
     def vision_emb_double(self, imgs_list):
         begin_time = time()
@@ -371,41 +403,59 @@ class BPU_RDT_Policy():
 
         rdt_begin_time = time()
 
-        # img embs
-        image_embeds = self.vision_emb(imgs)
-        image_embeds = image_embeds.reshape(-1, 1152).unsqueeze(0)
-    
-        # joints
-        joints = torch.from_numpy(joints[np.newaxis, np.newaxis, :])
-        states, state_elem_mask = self._format_joint_to_state(joints)    # (1, 1, 128), (1, 128)
-        state_tokens = states[:, -1:, :]  # (1, 1, 128)
-        action_mask=state_elem_mask.unsqueeze(1)
-        state_tokens = torch.cat([state_tokens, action_mask], dim=2)
+        pending = []
+        try:
+            if self.vision_emb == self.vision_emb_single:
+                self.vision_emb_submit(imgs, pending)
+            else:
+                # 双板或调用者自定义视觉路径仍同步调用，不宣称异步重叠。
+                image_embeds = self.vision_emb(imgs)
+            # joints
+            joints = torch.from_numpy(joints[np.newaxis, np.newaxis, :])
+            states, state_elem_mask = self._format_joint_to_state(joints)    # (1, 1, 128), (1, 128)
+            state_tokens = states[:, -1:, :]  # (1, 1, 128)
+            action_mask=state_elem_mask.unsqueeze(1)
+            state_tokens = torch.cat([state_tokens, action_mask], dim=2)
 
+            begin_time = time()
+            state_traj = torch.from_numpy(self.state_adaptor1.run([self.state_adaptor1.get_outputs()[0].name], {self.state_adaptor1.get_inputs()[0].name: state_tokens.numpy()})[0])
+            logger.debug("\033[92m" + f"state adaptor time = {1000*(time() - begin_time):.2f} ms" + "\033[0m")
+
+            # conditional_sample
+            begin_time = time()
+            ctrl_freqs = torch.tensor([self.control_frequency])
+            lang_attn_mask=torch.ones(self.lang_c.shape[:2], dtype=torch.bool)
+            noisy_action = torch.randn(size=(state_traj.shape[0], self.pred_horizon, self.action_dim),dtype=torch.float32)
+            action_mask = action_mask.expand(-1, self.pred_horizon, -1)
+            # Set step values
+            self.noise_scheduler_sample.set_timesteps(self.num_inference_timesteps)
+            logger.debug("\033[92m" + f"DiT conditional_sample time = {1000*(time() - begin_time):.2f} ms" + "\033[0m")
+
+            # 首轮 state2 只依赖初始噪声和 action mask，可与视觉执行重叠。
+            action_traj = torch.cat([noisy_action, action_mask], dim=2)
+            first_action_traj = torch.from_numpy(self.state_adaptor2.run([self.state_adaptor2.get_outputs()[0].name], {self.state_adaptor2.get_inputs()[0].name: action_traj.numpy()})[0])
+            del action_traj
+            if pending:
+                image_embeds = self.vision_emb_collect(pending)
+        finally:
+            self.vision_emb_drain(pending)
+
+        image_embeds = image_embeds.reshape(-1, 1152).unsqueeze(0)
         # adaptor
         begin_time = time()
         img_cond = torch.from_numpy(self.img_adaptor([image_embeds.float().contiguous().cpu().detach().numpy()])[0])
         logger.debug("\033[92m" + f"image adaptor time = {1000*(time() - begin_time):.2f} ms" + "\033[0m")
 
-        begin_time = time()
-        state_traj = torch.from_numpy(self.state_adaptor1.run([self.state_adaptor1.get_outputs()[0].name], {self.state_adaptor1.get_inputs()[0].name: state_tokens.numpy()})[0])
-        logger.debug("\033[92m" + f"state adaptor time = {1000*(time() - begin_time):.2f} ms" + "\033[0m")
 
-        # conditional_sample
-        begin_time = time()
-        ctrl_freqs = torch.tensor([self.control_frequency])
-        lang_attn_mask=torch.ones(self.lang_c.shape[:2], dtype=torch.bool)
-        noisy_action = torch.randn(size=(state_traj.shape[0], self.pred_horizon, self.action_dim),dtype=torch.float32)
-        action_mask = action_mask.expand(-1, self.pred_horizon, -1)
-        # Set step values
-        self.noise_scheduler_sample.set_timesteps(self.num_inference_timesteps)
-        logger.debug("\033[92m" + f"DiT conditional_sample time = {1000*(time() - begin_time):.2f} ms" + "\033[0m")
-
-        for t in self.noise_scheduler_sample.timesteps:
+        for step_index, t in enumerate(self.noise_scheduler_sample.timesteps):
             begin_time = time()
             # Prepare state-action trajectory
-            action_traj = torch.cat([noisy_action, action_mask], dim=2)
-            action_traj = torch.from_numpy(self.state_adaptor2.run([self.state_adaptor2.get_outputs()[0].name], {self.state_adaptor2.get_inputs()[0].name: action_traj.numpy()})[0])
+            if step_index == 0:
+                action_traj = first_action_traj
+                del first_action_traj
+            else:
+                action_traj = torch.cat([noisy_action, action_mask], dim=2)
+                action_traj = torch.from_numpy(self.state_adaptor2.run([self.state_adaptor2.get_outputs()[0].name], {self.state_adaptor2.get_inputs()[0].name: action_traj.numpy()})[0])
             state_action_traj = torch.cat([state_traj, action_traj], dim=1)
             # Predict the model output
             x = state_action_traj.float().contiguous().cpu().detach().numpy()

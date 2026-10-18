@@ -1,5 +1,7 @@
 English | [简体中文](./README_cn.md)
 
+> 本分支包含 CPU/BPU 重叠研究候选，尚未通过完整数值发布验收。改动范围、固定基线与测试方式见[研究说明](research/runtime-contract.md)。以下保留上游部署文档，其历史性能不作为本分支的测量结果。
+
 ```
 GitHub: https://github.com/WuChao-2024/RDK_RoboticsDiffusionTransformers_Tools
 FeiShu Document: https://horizonrobotics.feishu.cn/docx/IRVLdawAUoUAoUxNJv7cGlM4nHg
